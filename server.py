@@ -232,28 +232,117 @@ def extract_tasks_from_text(text, source_type="syllabus"):
             ))
             task_id += 1
 
-    # ── Pattern 3: Table rows like "Week | Date | Topic | Due" ──
-    table_due = re.findall(r'(PS|Project|Lab|Quiz|Midterm|Final|Essay)\s*#?\s*(\d*)', text, re.IGNORECASE)
-    for match_type, match_num in table_due:
-        title = f"{match_type} {match_num}".strip() if match_num else match_type
-        if title.lower() in seen_titles:
-            continue
-        seen_titles.add(title.lower())
-        is_exam = match_type.lower() in ('midterm', 'final')
-        tasks.append(dict(
-            id=task_id,
-            title=f"{title} — {course}",
-            course=course,
-            type='review' if is_exam else 'assignment',
-            difficulty=5 if is_exam else 3,
-            estimatedMinutes=150 if is_exam else 90,
-            dueDate="",
-            priority=task_id,
-            done=False,
-        ))
-        task_id += 1
+    # ── Pattern 3: Schedule table parser ──
+    # Syllabus tables often have: Week | Dates | Topic | Reading | Due
+    # When PDF text is flattened, dates and due items appear on nearby lines
+    # Scan for lines with dates near lines with task keywords
+    import calendar as cal_mod
 
-    return tasks[:15]  # Cap at 15 tasks
+    def try_parse_date(s):
+        """Parse various date formats into YYYY-MM-DD string."""
+        s = s.strip().rstrip('.')
+        year = datetime.date.today().year
+        # "Feb 4, 2026" / "February 4, 2026"
+        for f in ["%B %d, %Y","%B %d %Y","%b %d, %Y","%b %d %Y","%B %d","%b %d"]:
+            try:
+                d = datetime.datetime.strptime(s, f).date()
+                if d.year == 1900: d = d.replace(year=year)
+                return d.strftime("%Y-%m-%d")
+            except: pass
+        # "3/12" / "3/12/2026"
+        m = re.match(r'(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?', s)
+        if m:
+            try:
+                mn,dy = int(m.group(1)),int(m.group(2))
+                yr = int(m.group(3)) if m.group(3) else year
+                if yr < 100: yr += 2000
+                return datetime.date(yr, mn, dy).strftime("%Y-%m-%d")
+            except: pass
+        # "Mar 3, 5" -> take first date (Mar 3)
+        m = re.match(r'(\w{3,})\s+(\d{1,2})', s)
+        if m:
+            try:
+                mn = list(cal_mod.month_abbr).index(m.group(1)[:3].capitalize())
+                return datetime.date(year, mn, int(m.group(2))).strftime("%Y-%m-%d")
+            except: pass
+        return None
+
+    # Scan for schedule-like rows: look for date + due item on same or adjacent lines
+    for i, line in enumerate(lines):
+        # Find lines containing both a date and a due keyword
+        date_in_line = None
+        # Check for dates in this line and nearby lines
+        for offset in [0, -1, -2]:
+            if 0 <= i + offset < len(lines):
+                check_line = lines[i + offset]
+                # Extract potential dates
+                date_matches = re.findall(r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{1,2}(?:,?\s*\d{4})?|\d{1,2}/\d{1,2}(?:/\d{2,4})?', check_line, re.IGNORECASE)
+                for dm in date_matches:
+                    parsed = try_parse_date(dm)
+                    if parsed:
+                        date_in_line = parsed
+                        break
+            if date_in_line:
+                break
+
+        if not date_in_line:
+            continue
+
+        # Check if this line (or nearby) mentions a due item
+        search_area = " ".join(lines[max(0,i-1):i+2])
+        due_match = re.search(r'(PS|Problem Set|Project|Lab|Midterm|Final|Quiz|Essay|Homework|HW)\s*#?\s*(\d*)', search_area, re.IGNORECASE)
+        if not due_match:
+            continue
+
+        title = f"{due_match.group(1)} {due_match.group(2)}".strip() if due_match.group(2) else due_match.group(1)
+        title_key = re.sub(r'[^a-z0-9]', '', title.lower())
+
+        # Update existing task with this due date, or create new one
+        updated = False
+        for t in tasks:
+            t_key = re.sub(r'[^a-z0-9]', '', t['title'].lower())
+            if title_key in t_key or t_key in title_key:
+                if not t['dueDate']:
+                    t['dueDate'] = date_in_line
+                    updated = True
+                    break
+
+        if not updated and title_key not in seen_titles:
+            seen_titles.add(title_key)
+            is_exam = due_match.group(1).lower() in ('midterm', 'final')
+            tasks.append(dict(
+                id=task_id, title=f"{title} — {course}", course=course,
+                type='review' if is_exam else 'assignment',
+                difficulty=5 if is_exam else 3,
+                estimatedMinutes=150 if is_exam else 90,
+                dueDate=date_in_line, priority=task_id, done=False,
+            ))
+            task_id += 1
+
+    # ── Pattern 4: Explicit "Due: DATE" lines from assignment PDFs ──
+    for i, line in enumerate(lines):
+        due_m = re.search(r'(?:Due|Deadline)[:\s]+(\w+(?:day)?,?\s+\w+\s+\d{1,2},?\s*\d{0,4}|\d{1,2}/\d{1,2}(?:/\d{2,4})?)', line, re.IGNORECASE)
+        if not due_m:
+            continue
+        parsed_date = try_parse_date(due_m.group(1))
+        if not parsed_date:
+            continue
+        # Find the nearest task above this line that has no due date
+        for t in reversed(tasks):
+            if not t['dueDate']:
+                t['dueDate'] = parsed_date
+                break
+
+    # ── Assign fallback dates for tasks without due dates ──
+    today = datetime.date.today()
+    tasks_without_dates = [t for t in tasks if not t.get('dueDate')]
+    for idx, t in enumerate(tasks_without_dates):
+        # Spread undated tasks across the next 4 weeks
+        offset = 7 + (idx * 5)  # Every ~5 days starting 1 week out
+        fallback = today + datetime.timedelta(days=offset)
+        t['dueDate'] = fallback.strftime("%Y-%m-%d")
+
+    return tasks[:15]
 
 def generate_insights_from_events(events, tasks):
     """Generate smart insights locally from calendar events and tasks."""
@@ -300,49 +389,155 @@ def generate_insights_from_events(events, tasks):
     return insights[:5]
 
 def generate_study_blocks(events, tasks):
-    """Schedule study blocks around calendar events."""
-    blocks = []
-    days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    """Generate date-aware study blocks across multiple weeks.
+    Breaks tasks into micro-sessions and schedules them on real calendar dates,
+    working backwards from deadlines and avoiding busy hours."""
 
-    # Find busy hours per day from events
-    busy_hours = {d: set() for d in days}
+    blocks = []
+    today = datetime.date.today()
+
+    # ── Build busy-hours map keyed by actual date ──
+    busy_by_date = {}  # "2026-03-10" -> {11, 12, 15, 16}
     for ev in events:
         start = ev.get("start", "")
-        # Handle Google Calendar raw format: {"dateTime": "..."} or {"date": "..."}
         if isinstance(start, dict):
             start = start.get("dateTime") or start.get("date") or ""
         if not start or not isinstance(start, str) or "T" not in start:
             continue
         try:
             dt = datetime.datetime.fromisoformat(start.replace("Z", "+00:00"))
-            day_name = dt.strftime("%a")[:3]
-            if day_name in busy_hours:
-                busy_hours[day_name].add(dt.hour)
+            date_str = dt.strftime("%Y-%m-%d")
+            if date_str not in busy_by_date:
+                busy_by_date[date_str] = set()
+            # Block the event hour and the one before/after
+            for h in range(max(0, dt.hour - 1), min(24, dt.hour + 2)):
+                busy_by_date[date_str].add(h)
         except:
             pass
 
-    # Available study slots (prefer morning and evening)
+    # ── Available study slots per day ──
     study_slots = [
-        ("9:00 AM", 9), ("10:00 AM", 10), ("2:00 PM", 14),
-        ("3:00 PM", 15), ("4:00 PM", 16), ("7:00 PM", 19), ("8:00 PM", 20),
+        ("9:00 AM", 9), ("10:00 AM", 10), ("11:00 AM", 11),
+        ("1:00 PM", 13), ("2:00 PM", 14), ("3:00 PM", 15),
+        ("4:00 PM", 16), ("7:00 PM", 19), ("8:00 PM", 20),
     ]
 
-    task_idx = 0
-    for day in days:
-        if task_idx >= len(tasks):
-            break
-        for time_str, hour in study_slots:
-            if task_idx >= len(tasks):
-                break
-            # Skip if there's a class at this hour
-            if hour in busy_hours.get(day, set()):
+    # ── Parse due dates and compute scheduling windows ──
+    def parse_due(due_str):
+        """Try to parse various date formats into a date object."""
+        if not due_str:
+            return None
+        import calendar as cal_mod
+        # Common formats
+        for fmt_str in ["%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y",
+                    "%m/%d/%Y", "%m/%d/%y", "%m/%d",
+                    "%A, %B %d", "%a, %b %d",
+                    "%a %m/%d", "%A %m/%d"]:
+            try:
+                d = datetime.datetime.strptime(due_str.strip(), fmt_str).date()
+                # If year is missing, use current year
+                if d.year == 1900:
+                    d = d.replace(year=today.year)
+                return d
+            except:
                 continue
-            t = tasks[task_idx]
-            duration = min(t.get("estimatedMinutes", 60), 90)  # Cap blocks at 90min
-            blocks.append(dict(day=day, time=time_str, task=t["title"], duration=duration))
-            task_idx += 1
+        # Try "Wed, Feb 4" / "Thu 3/12" style
+        m = re.search(r'(\d{1,2})/(\d{1,2})', due_str)
+        if m:
+            try:
+                month, day = int(m.group(1)), int(m.group(2))
+                return datetime.date(today.year, month, day)
+            except:
+                pass
+        # "March 12" / "Mar 12"
+        m = re.search(r'(\w+)\s+(\d{1,2})', due_str)
+        if m:
+            try:
+                month_str, day = m.group(1), int(m.group(2))
+                month_num = list(cal_mod.month_abbr).index(month_str[:3].capitalize())
+                return datetime.date(today.year, month_num, day)
+            except:
+                pass
+        return None
 
-    return blocks[:15]
+    # ── Break tasks into micro-sessions and schedule them ──
+    scheduled_slots = {}  # "2026-03-10_14" -> True (tracks used slots)
+
+    for task in sorted(tasks, key=lambda t: t.get('difficulty', 3), reverse=True):
+        due = parse_due(task.get('dueDate', ''))
+        est = task.get('estimatedMinutes', 60)
+        difficulty = task.get('difficulty', 3)
+
+        # Default deadline: 2 weeks from today if none specified
+        if not due or due <= today:
+            due = today + datetime.timedelta(days=14)
+
+        # How many sessions to break this into
+        session_len = 45 if difficulty >= 4 else 60  # Harder tasks get shorter, more frequent sessions
+        num_sessions = max(1, min(6, (est + session_len - 1) // session_len))
+
+        # Spread sessions across days leading up to deadline
+        days_until = max(1, (due - today).days)
+        # Start studying at least this many days before due
+        start_offset = min(days_until, max(3, num_sessions * 2))
+
+        sessions_placed = 0
+        # Try to place sessions evenly spaced before the deadline
+        for s in range(num_sessions):
+            if sessions_placed >= num_sessions:
+                break
+
+            # Target day: spread evenly from (start_offset days before due) to (1 day before due)
+            day_offset = start_offset - int(s * (start_offset - 1) / max(1, num_sessions - 1))
+            target_date = due - datetime.timedelta(days=day_offset)
+            if target_date <= today:
+                target_date = today + datetime.timedelta(days=1)
+
+            # Try target day, then nearby days
+            for day_adj in [0, 1, -1, 2, -2, 3]:
+                try_date = target_date + datetime.timedelta(days=day_adj)
+                if try_date <= today or try_date >= due:
+                    continue
+                date_str = try_date.strftime("%Y-%m-%d")
+                busy = busy_by_date.get(date_str, set())
+
+                # Find an open slot
+                for time_str, hour in study_slots:
+                    slot_key = f"{date_str}_{hour}"
+                    if slot_key in scheduled_slots:
+                        continue
+                    if hour in busy:
+                        continue
+
+                    # Place the session
+                    session_title = task['title']
+                    if num_sessions > 1:
+                        session_title = f"{task['title']} (part {sessions_placed+1}/{num_sessions})"
+
+                    blocks.append(dict(
+                        date=date_str,
+                        day=try_date.strftime("%a"),
+                        time=time_str,
+                        hour=hour,
+                        task=task['title'],
+                        sessionTitle=session_title,
+                        duration=session_len,
+                        course=task.get('course', ''),
+                        type=task.get('type', 'review'),
+                        difficulty=difficulty,
+                        dueDate=due.strftime("%Y-%m-%d"),
+                        taskId=task.get('id'),
+                    ))
+                    scheduled_slots[slot_key] = True
+                    sessions_placed += 1
+                    break
+                else:
+                    continue
+                break
+
+    # Sort by date and time
+    blocks.sort(key=lambda b: (b['date'], b.get('hour', 0)))
+    return blocks
 
 def gemini_request_light(prompt, max_tokens=800):
     """Lightweight Gemini call with retry across multiple models.
