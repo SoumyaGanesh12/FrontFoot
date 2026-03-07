@@ -1,0 +1,25 @@
+# Environment & secrets
+.env
+client_secret.json
+
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+
+# Build output
+dist/
+
+# Uploads
+uploads/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
