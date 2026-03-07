@@ -133,12 +133,17 @@ def list_events():
 @app.route("/api/upload",methods=["POST"])
 @need_auth
 def upload():
-    if "file" not in request.files: return jsonify(error="No file"),400
+    if "file" not in request.files:
+        print("[upload] No file in request")
+        return jsonify(error="No file"),400
     f=request.files["file"]; ft=request.form.get("type","syllabus")
-    if f.filename=="" or not ok_file(f.filename): return jsonify(error="Invalid file"),400
+    if f.filename=="" or not ok_file(f.filename):
+        print(f"[upload] Invalid file: {f.filename}")
+        return jsonify(error="Invalid file"),400
     fn=secure_filename(f"{ft}_{uuid.uuid4().hex[:8]}_{f.filename}")
     fp=UPLOAD_DIR/fn; f.save(fp)
     text=read_file(str(fp))
+    print(f"[upload] Saved {f.filename} as {fn} ({len(text)} chars extracted)")
     if "uploads" not in session: session["uploads"]={}
     session["uploads"][ft]=dict(filename=f.filename,path=str(fp),text=text[:5000],uploaded_at=datetime.datetime.now().isoformat())
     session.modified=True
@@ -170,42 +175,99 @@ Help with: study resources, strategies, time management, course-specific questio
     contents=[{"role":"user" if m["role"]=="user" else "model","parts":[{"text":m["content"]}]} for m in history]
     contents.append({"role":"user","parts":[{"text":msg}]})
     try:
+        print(f"[ai_chat] Sending message: {msg[:80]}...")
         r=http_req.post(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}",json=dict(contents=contents,systemInstruction=dict(parts=[dict(text=system)]),generationConfig=dict(temperature=0.7,maxOutputTokens=1500)),timeout=30)
-        r.raise_for_status(); res=r.json()
+        if r.status_code != 200:
+            print(f"[ai_chat] Gemini error {r.status_code}: {r.text[:300]}")
+            return jsonify(error=f"Gemini API error {r.status_code}: {r.text[:200]}"),500
+        res=r.json()
         txt="".join(p.get("text","") for p in res.get("candidates",[{}])[0].get("content",{}).get("parts",[]))
         return jsonify(response=txt or "Couldn't generate a response.")
-    except Exception as e: return jsonify(error=str(e)),500
+    except Exception as e:
+        print(f"[ai_chat] Error: {type(e).__name__}: {e}")
+        return jsonify(error=str(e)),500
 
 # ═══ PLAN GENERATION ═══
+def clean_json(txt):
+    """Strip markdown fences and extract JSON from Gemini response."""
+    import re
+    txt = txt.strip()
+    # Remove ```json ... ``` or ``` ... ```
+    m = re.search(r'```(?:json)?\s*\n?(.*?)```', txt, re.DOTALL)
+    if m:
+        txt = m.group(1).strip()
+    # Fallback: find first { to last }
+    if not txt.startswith('{'):
+        start = txt.find('{')
+        end = txt.rfind('}')
+        if start != -1 and end != -1:
+            txt = txt[start:end+1]
+    return txt
+
 @app.route("/api/generate-plan",methods=["POST"])
 @need_auth
 def gen_plan():
-    if not GEMINI_KEY: return jsonify(error="GEMINI_API_KEY required"),500
+    if not GEMINI_KEY:
+        print("[gen_plan] ERROR: No GEMINI_API_KEY set")
+        return jsonify(error="GEMINI_API_KEY required — get one free at https://aistudio.google.com/apikey"),500
+
     cal_ctx=get_week_events()
     upload_ctx=""
     for ft,info in session.get("uploads",{}).items():
         upload_ctx+=f"\n\n=== {ft.upper()} ({info['filename']}) ===\n{info.get('text','')[:3000]}"
-    prompt=f"""Analyze the student's uploaded course materials and calendar. Return ONLY valid JSON (no markdown).
+
+    print(f"[gen_plan] Calendar context: {cal_ctx[:100]}...")
+    print(f"[gen_plan] Upload context length: {len(upload_ctx)} chars")
+
+    prompt=f"""Analyze the student's uploaded course materials and calendar. Return ONLY valid JSON (no markdown fences, no explanation).
 
 {cal_ctx}
 
 UPLOADED MATERIALS:{upload_ctx or " None yet."}
 
-Return this JSON structure:
+Return ONLY this JSON structure (no text before or after):
 {{"tasks":[{{"title":"...","course":"...","type":"reading|assignment|review|lecture","difficulty":1,"estimatedMinutes":60,"dueDate":"2026-03-14","priority":1}}],"insights":[{{"type":"danger|tip|info|warn","message":"..."}}],"studyBlocks":[{{"day":"Mon","time":"9:00 AM","task":"...","duration":60}}]}}
 
 Generate 8-12 tasks, 3-4 insights, 10-15 study blocks scheduled around calendar events."""
 
     try:
-        r=http_req.post(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}",json=dict(contents=[dict(role="user",parts=[dict(text=prompt)])],generationConfig=dict(temperature=0.3,maxOutputTokens=3000)),timeout=45)
-        r.raise_for_status(); res=r.json()
-        txt="".join(p.get("text","") for p in res.get("candidates",[{}])[0].get("content",{}).get("parts",[]))
-        txt=txt.strip()
-        if txt.startswith("```"): txt=txt.split("\n",1)[1]
-        if txt.endswith("```"): txt=txt.rsplit("```",1)[0]
-        return jsonify(plan=json.loads(txt.strip()))
-    except json.JSONDecodeError: return jsonify(error="AI returned invalid JSON"),500
-    except Exception as e: return jsonify(error=str(e)),500
+        r=http_req.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}",
+            json=dict(
+                contents=[dict(role="user",parts=[dict(text=prompt)])],
+                generationConfig=dict(temperature=0.3,maxOutputTokens=3000,responseMimeType="application/json")
+            ),
+            timeout=45
+        )
+
+        if r.status_code != 200:
+            print(f"[gen_plan] Gemini API error {r.status_code}: {r.text[:500]}")
+            return jsonify(error=f"Gemini API returned {r.status_code}: {r.text[:200]}"),500
+
+        res=r.json()
+        candidates=res.get("candidates",[])
+        if not candidates:
+            print(f"[gen_plan] No candidates in response: {json.dumps(res)[:500]}")
+            return jsonify(error="Gemini returned no candidates — possibly blocked by safety filters"),500
+
+        txt="".join(p.get("text","") for p in candidates[0].get("content",{}).get("parts",[]))
+        print(f"[gen_plan] Raw Gemini response (first 300 chars): {txt[:300]}")
+
+        txt = clean_json(txt)
+        plan = json.loads(txt)
+        print(f"[gen_plan] Success — {len(plan.get('tasks',[]))} tasks, {len(plan.get('insights',[]))} insights")
+        return jsonify(plan=plan)
+
+    except json.JSONDecodeError as e:
+        print(f"[gen_plan] JSON parse error: {e}")
+        print(f"[gen_plan] Cleaned text was: {txt[:500]}")
+        return jsonify(error=f"AI returned invalid JSON: {str(e)}"),500
+    except http_req.exceptions.Timeout:
+        print("[gen_plan] Gemini API timed out")
+        return jsonify(error="Gemini API timed out — try again"),500
+    except Exception as e:
+        print(f"[gen_plan] Unexpected error: {type(e).__name__}: {e}")
+        return jsonify(error=f"{type(e).__name__}: {str(e)}"),500
 
 @app.route("/health")
 def health(): return jsonify(status="ok",gemini=bool(GEMINI_KEY),oauth=os.path.exists(CLIENT_SECRETS))
