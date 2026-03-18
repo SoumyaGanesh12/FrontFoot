@@ -1,28 +1,75 @@
 """
-StudyFlow.ai — Full Backend
-Google Calendar OAuth2 + Gemini AI + PDF/DOCX Upload & Parsing
+Cognitive Scaffold — Backend
+Google Calendar OAuth2 + Gemini AI (Groq fallback)
 """
-import os, json, datetime, uuid, re, time
+
+import os, json, datetime, re
 from functools import wraps
-from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from flask import Flask, redirect, request, jsonify, session
 from flask_cors import CORS
-from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 import requests as http_req
 
+
+def try_parse_json(text):
+    if not text:
+        return None
+    # Direct parse
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # Strip markdown fences
+    cleaned = re.sub(r"```(?:json)?\s*", "", text).strip().rstrip("`")
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        pass
+    # Repair truncated JSON
+    repaired = cleaned.rstrip()
+    # Remove trailing incomplete key:value like  ,"key": or ,"key":"partial
+    repaired = re.sub(r""",?\s*"[^"]*"\s*:\s*"?[^"}\]]*$""", "", repaired)
+    # Close unclosed brackets
+    stack = []
+    in_str = False
+    esc = False
+    for ch in repaired:
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]" and stack:
+            stack.pop()
+    repaired += "".join(reversed(stack))
+    try:
+        result = json.loads(repaired)
+        print("[json_repair] Repaired truncated JSON")
+        return result
+    except Exception as e:
+        print(f"[json_repair] Repair failed: {e}")
+    return None
+
+
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "studyflow-dev-key")
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "cognitive-scaffold-dev-key")
 CORS(app, supports_credentials=True, origins=["http://localhost:5173"])
 
-UPLOAD_DIR = Path("uploads"); UPLOAD_DIR.mkdir(exist_ok=True)
-ALLOWED_EXT = {"pdf","docx","png","jpg","jpeg","txt"}
 CLIENT_SECRETS = os.getenv("GOOGLE_CLIENT_SECRETS", "client_secret.json")
 SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI", "http://localhost:5000/auth/callback")
@@ -30,736 +77,681 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 GROQ_KEY = os.getenv("GROQ_API_KEY", "")
 
-def ok_file(fn): return "." in fn and fn.rsplit(".",1)[1].lower() in ALLOWED_EXT
-def get_flow(): return Flow.from_client_secrets_file(CLIENT_SECRETS, scopes=SCOPES, redirect_uri=REDIRECT_URI)
+
+def get_flow():
+    return Flow.from_client_secrets_file(
+        CLIENT_SECRETS, scopes=SCOPES, redirect_uri=REDIRECT_URI
+    )
+
 
 def creds():
-    if "creds" not in session: return None
+    if "creds" not in session:
+        return None
     d = session["creds"]
-    return Credentials(token=d["token"],refresh_token=d.get("refresh_token"),token_uri=d["token_uri"],client_id=d["client_id"],client_secret=d["client_secret"],scopes=d.get("scopes"))
+    return Credentials(
+        token=d["token"],
+        refresh_token=d.get("refresh_token"),
+        token_uri=d["token_uri"],
+        client_id=d["client_id"],
+        client_secret=d["client_secret"],
+        scopes=d.get("scopes"),
+    )
+
 
 def save_creds(c):
-    session["creds"]=dict(token=c.token,refresh_token=c.refresh_token,token_uri=c.token_uri,client_id=c.client_id,client_secret=c.client_secret,scopes=list(c.scopes) if c.scopes else SCOPES)
+    session["creds"] = dict(
+        token=c.token,
+        refresh_token=c.refresh_token,
+        token_uri=c.token_uri,
+        client_id=c.client_id,
+        client_secret=c.client_secret,
+        scopes=list(c.scopes) if c.scopes else SCOPES,
+    )
+
 
 def cal_svc():
-    c=creds(); return build("calendar","v3",credentials=c) if c else None
+    c = creds()
+    return build("calendar", "v3", credentials=c) if c else None
+
 
 def need_auth(f):
     @wraps(f)
-    def d(*a,**kw):
-        if "creds" not in session: return jsonify(error="Not authenticated"),401
-        return f(*a,**kw)
-    return d
+    def wrapper(*a, **kw):
+        if "creds" not in session:
+            return jsonify(error="Not authenticated"), 401
+        return f(*a, **kw)
 
-def read_pdf(path):
-    try:
-        import fitz
-        doc=fitz.open(path); t="".join(p.get_text() for p in doc); doc.close(); return t.strip()
-    except ImportError: return "[Install PyMuPDF: pip install pymupdf]"
-    except Exception as e: return f"[PDF error: {e}]"
+    return wrapper
 
-def read_file(path):
-    ext=Path(path).suffix.lower()
-    if ext==".pdf": return read_pdf(path)
-    elif ext==".txt":
-        with open(path,"r",errors="ignore") as f: return f.read()
-    elif ext==".docx":
-        try:
-            import docx; return "\n".join(p.text for p in docx.Document(path).paragraphs)
-        except ImportError: return "[Install: pip install python-docx]"
-    return f"[Unsupported: {ext}]"
 
-def get_week_events():
-    """Fetch this week's events as text context."""
-    try:
-        svc=cal_svc()
-        if not svc: return "No calendar connected."
-        now=datetime.datetime.now(); s=now.replace(hour=0,minute=0,second=0); e=s+datetime.timedelta(days=7)
-        cals=svc.calendarList().list().execute().get("items",[])
-        lines=[]
-        for cal in cals:
-            if "#holiday@" in cal["id"]: continue
-            try:
-                evts=svc.events().list(calendarId=cal["id"],timeMin=s.isoformat()+"Z",timeMax=e.isoformat()+"Z",singleEvents=True,orderBy="startTime").execute()
-                for ev in evts.get("items",[]):
-                    st=ev.get("start",{}); loc=f" @ {ev['location']}" if ev.get("location") else ""
-                    lines.append(f"- {ev.get('summary','Event')}: {st.get('dateTime',st.get('date',''))}{loc} [{cal.get('summary','')}]")
-            except: continue
-        return "This week's calendar:\n"+"\n".join(lines) if lines else "No events found."
-    except: return "Calendar unavailable."
+# --- AI PROVIDERS ---
 
-# ═══ AUTH ═══
-@app.route("/auth/login")
-def auth_login():
-    f=get_flow(); url,st=f.authorization_url(access_type="offline",prompt="consent"); session["state"]=st; return redirect(url)
 
-@app.route("/auth/callback")
-def auth_callback():
-    f=get_flow(); f.fetch_token(authorization_response=request.url); save_creds(f.credentials); return redirect(f"{FRONTEND_URL}?auth=success")
-
-@app.route("/auth/status")
-def auth_status(): return jsonify(authenticated="creds" in session)
-
-@app.route("/auth/logout",methods=["POST"])
-def auth_logout(): session.clear(); return jsonify(ok=True)
-
-# ═══ CALENDAR ═══
-@app.route("/api/calendars")
-@need_auth
-def list_cals():
-    svc=cal_svc(); r=svc.calendarList().list().execute()
-    return jsonify(calendars=[dict(id=c["id"],name=c.get("summary",""),color=c.get("backgroundColor","#4285f4"),primary=c.get("primary",False)) for c in r.get("items",[]) if "#holiday@" not in c["id"]])
-
-@app.route("/api/events")
-@need_auth
-def list_events():
-    svc=cal_svc(); t0=request.args.get("timeMin"); t1=request.args.get("timeMax"); tz=request.args.get("timeZone","America/New_York")
-    if not t0 or not t1: return jsonify(error="timeMin/timeMax required"),400
-    if not t0.endswith("Z"): t0+="Z"
-    if not t1.endswith("Z"): t1+="Z"
-    cals=svc.calendarList().list().execute().get("items",[])
-    out=[]
-    for cal in cals:
-        if "#holiday@" in cal["id"]: continue
-        try:
-            evts=svc.events().list(calendarId=cal["id"],timeMin=t0,timeMax=t1,timeZone=tz,singleEvents=True,orderBy="startTime").execute()
-            for e in evts.get("items",[]):
-                s,en=e.get("start",{}),e.get("end",{})
-                out.append(dict(id=e.get("id"),summary=e.get("summary",""),location=e.get("location",""),start=s.get("dateTime") or s.get("date",""),end=en.get("dateTime") or en.get("date",""),allDay="date" in s and "dateTime" not in s,calendarName=cal.get("summary",""),calendarColor=cal.get("backgroundColor","#4285f4")))
-        except: continue
-    out.sort(key=lambda e:e["start"])
-    return jsonify(events=out,count=len(out))
-
-# ═══ UPLOAD ═══
-@app.route("/api/upload",methods=["POST"])
-@need_auth
-def upload():
-    if "file" not in request.files: return jsonify(error="No file"),400
-    f=request.files["file"]; ft=request.form.get("type","syllabus")
-    if f.filename=="" or not ok_file(f.filename): return jsonify(error="Invalid file"),400
-    fn=secure_filename(f"{ft}_{uuid.uuid4().hex[:8]}_{f.filename}")
-    fp=UPLOAD_DIR/fn; f.save(fp)
-    text=read_file(str(fp))
-    if "uploads" not in session: session["uploads"]={}
-    session["uploads"][ft]=dict(filename=f.filename,path=str(fp),text=text[:5000],uploaded_at=datetime.datetime.now().isoformat())
-    session.modified=True
-    return jsonify(success=True,filename=f.filename,type=ft,textLength=len(text),preview=text[:300]+("..." if len(text)>300 else ""))
-
-@app.route("/api/uploads")
-@need_auth
-def list_uploads():
-    u=session.get("uploads",{})
-    return jsonify(uploads={k:dict(filename=v["filename"],uploaded_at=v["uploaded_at"]) for k,v in u.items()})
-
-# ═══ SMART PLAN EXTRACTION (LOCAL — no API needed) ═══
-def extract_tasks_from_text(text, source_type="syllabus"):
-    """Parse uploaded text to extract tasks, deadlines, and course info locally.
-    No Gemini call needed — uses regex patterns to find assignments, dates, etc."""
-    tasks = []
-    task_id = 1
-
-    # Detect course name from text
-    course_match = re.search(r'(CS|EC|LJ|CDS|MA|PH|BI|CH|ENG|HI|PS)\s*(\d{3})', text, re.IGNORECASE)
-    course = f"{course_match.group(1).upper()} {course_match.group(2)}" if course_match else "General"
-
-    # ── Pattern 1: "Due: <date>" or "Due <date>" lines ──
-    due_patterns = [
-        r'(?:due|deadline|submit(?:ted)?)\s*[:\-—]?\s*(\w+day,?\s+\w+\s+\d{1,2},?\s*\d{0,4})',
-        r'(?:due|deadline)\s*[:\-—]?\s*(\d{1,2}/\d{1,2}(?:/\d{2,4})?)',
-        r'(?:due|deadline)\s*[:\-—]?\s*(\w+\s+\d{1,2},?\s*\d{4})',
-    ]
-
-    # ── Pattern 2: Problem Set / Assignment / Homework / Lab / Project / Exam / Quiz ──
-    task_patterns = [
-        (r'(Problem Set|PS|Homework|HW)\s*#?\s*(\d+)', 'assignment', 4, 120),
-        (r'(Programming Project|Project)\s*#?\s*(\d+)', 'assignment', 5, 180),
-        (r'(Lab)\s*#?\s*(\d+)', 'assignment', 3, 90),
-        (r'(Midterm|Mid-term)\s*(Exam)?', 'review', 5, 150),
-        (r'(Final)\s*(Exam)?', 'review', 5, 180),
-        (r'(Quiz)\s*#?\s*(\d+)?', 'review', 2, 45),
-        (r'(Essay|Paper)\s*(?:draft)?', 'assignment', 4, 120),
-        (r'(Reading|Read)\s+(?:Ch(?:apter)?\.?\s*)?(\d+)', 'reading', 2, 60),
-        (r'(Review)\s+(?:lecture|notes|chapter)', 'review', 3, 45),
-        (r'(Vocab|Vocabulary)\s+(?:quiz|test|prep)', 'review', 2, 30),
-    ]
-
-    lines = text.split('\n')
-    seen_titles = set()
-
-    for i, line in enumerate(lines):
-        for pattern, task_type, difficulty, est_minutes in task_patterns:
-            match = re.search(pattern, line, re.IGNORECASE)
-            if not match:
-                continue
-
-            # Build title
-            title = match.group(0).strip()
-            # Look for more context on the same line
-            rest = line[match.end():].strip(' \t:—-–')
-            if rest and len(rest) < 80:
-                title = f"{title} — {rest}"
-            title = re.sub(r'\s+', ' ', title).strip()
-
-            if title.lower() in seen_titles or len(title) < 4:
-                continue
-            seen_titles.add(title.lower())
-
-            # Try to find a due date nearby (same line or next 3 lines)
-            due_date = None
-            search_block = " ".join(lines[i:i+4])
-            for dp in due_patterns:
-                dm = re.search(dp, search_block, re.IGNORECASE)
-                if dm:
-                    due_date = dm.group(1)
-                    break
-
-            # Also check for dates in common formats on the line
-            if not due_date:
-                date_m = re.search(r'(\w+\s+\d{1,2},?\s*\d{4}|\d{1,2}/\d{1,2}(?:/\d{2,4})?)', line)
-                if date_m:
-                    due_date = date_m.group(1)
-
-            tasks.append(dict(
-                id=task_id,
-                title=title,
-                course=course,
-                type=task_type,
-                difficulty=difficulty,
-                estimatedMinutes=est_minutes,
-                dueDate=due_date or "",
-                priority=task_id,
-                done=False,
-            ))
-            task_id += 1
-
-    # ── Pattern 3: Schedule table parser ──
-    # Syllabus tables often have: Week | Dates | Topic | Reading | Due
-    # When PDF text is flattened, dates and due items appear on nearby lines
-    # Scan for lines with dates near lines with task keywords
-    import calendar as cal_mod
-
-    def try_parse_date(s):
-        """Parse various date formats into YYYY-MM-DD string."""
-        s = s.strip().rstrip('.')
-        year = datetime.date.today().year
-        # "Feb 4, 2026" / "February 4, 2026"
-        for f in ["%B %d, %Y","%B %d %Y","%b %d, %Y","%b %d %Y","%B %d","%b %d"]:
-            try:
-                d = datetime.datetime.strptime(s, f).date()
-                if d.year == 1900: d = d.replace(year=year)
-                return d.strftime("%Y-%m-%d")
-            except: pass
-        # "3/12" / "3/12/2026"
-        m = re.match(r'(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?', s)
-        if m:
-            try:
-                mn,dy = int(m.group(1)),int(m.group(2))
-                yr = int(m.group(3)) if m.group(3) else year
-                if yr < 100: yr += 2000
-                return datetime.date(yr, mn, dy).strftime("%Y-%m-%d")
-            except: pass
-        # "Mar 3, 5" -> take first date (Mar 3)
-        m = re.match(r'(\w{3,})\s+(\d{1,2})', s)
-        if m:
-            try:
-                mn = list(cal_mod.month_abbr).index(m.group(1)[:3].capitalize())
-                return datetime.date(year, mn, int(m.group(2))).strftime("%Y-%m-%d")
-            except: pass
+def gemini_call(
+    system_prompt,
+    user_prompt,
+    model="gemini-2.5-flash-lite",
+    max_tokens=2000,
+    json_mode=False,
+):
+    if not GEMINI_KEY:
         return None
-
-    # Scan for schedule-like rows: look for date + due item on same or adjacent lines
-    for i, line in enumerate(lines):
-        # Find lines containing both a date and a due keyword
-        date_in_line = None
-        # Check for dates in this line and nearby lines
-        for offset in [0, -1, -2]:
-            if 0 <= i + offset < len(lines):
-                check_line = lines[i + offset]
-                # Extract potential dates
-                date_matches = re.findall(r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{1,2}(?:,?\s*\d{4})?|\d{1,2}/\d{1,2}(?:/\d{2,4})?', check_line, re.IGNORECASE)
-                for dm in date_matches:
-                    parsed = try_parse_date(dm)
-                    if parsed:
-                        date_in_line = parsed
-                        break
-            if date_in_line:
-                break
-
-        if not date_in_line:
-            continue
-
-        # Check if this line (or nearby) mentions a due item
-        search_area = " ".join(lines[max(0,i-1):i+2])
-        due_match = re.search(r'(PS|Problem Set|Project|Lab|Midterm|Final|Quiz|Essay|Homework|HW)\s*#?\s*(\d*)', search_area, re.IGNORECASE)
-        if not due_match:
-            continue
-
-        title = f"{due_match.group(1)} {due_match.group(2)}".strip() if due_match.group(2) else due_match.group(1)
-        title_key = re.sub(r'[^a-z0-9]', '', title.lower())
-
-        # Update existing task with this due date, or create new one
-        updated = False
-        for t in tasks:
-            t_key = re.sub(r'[^a-z0-9]', '', t['title'].lower())
-            if title_key in t_key or t_key in title_key:
-                if not t['dueDate']:
-                    t['dueDate'] = date_in_line
-                    updated = True
-                    break
-
-        if not updated and title_key not in seen_titles:
-            seen_titles.add(title_key)
-            is_exam = due_match.group(1).lower() in ('midterm', 'final')
-            tasks.append(dict(
-                id=task_id, title=f"{title} — {course}", course=course,
-                type='review' if is_exam else 'assignment',
-                difficulty=5 if is_exam else 3,
-                estimatedMinutes=150 if is_exam else 90,
-                dueDate=date_in_line, priority=task_id, done=False,
-            ))
-            task_id += 1
-
-    # ── Pattern 4: Explicit "Due: DATE" lines from assignment PDFs ──
-    for i, line in enumerate(lines):
-        due_m = re.search(r'(?:Due|Deadline)[:\s]+(\w+(?:day)?,?\s+\w+\s+\d{1,2},?\s*\d{0,4}|\d{1,2}/\d{1,2}(?:/\d{2,4})?)', line, re.IGNORECASE)
-        if not due_m:
-            continue
-        parsed_date = try_parse_date(due_m.group(1))
-        if not parsed_date:
-            continue
-        # Find the nearest task above this line that has no due date
-        for t in reversed(tasks):
-            if not t['dueDate']:
-                t['dueDate'] = parsed_date
-                break
-
-    # ── Assign fallback dates for tasks without due dates ──
-    today = datetime.date.today()
-    tasks_without_dates = [t for t in tasks if not t.get('dueDate')]
-    for idx, t in enumerate(tasks_without_dates):
-        # Spread undated tasks across the next 4 weeks
-        offset = 7 + (idx * 5)  # Every ~5 days starting 1 week out
-        fallback = today + datetime.timedelta(days=offset)
-        t['dueDate'] = fallback.strftime("%Y-%m-%d")
-
-    return tasks[:15]
-
-def generate_insights_from_events(events, tasks):
-    """Generate smart insights locally from calendar events and tasks."""
-    insights = []
-
-    # Analyze busiest days
-    day_load = {}
-    for ev in events:
-        start = ev.get("start", "")
-        # Handle Google Calendar raw format: {"dateTime": "..."} or {"date": "..."}
-        if isinstance(start, dict):
-            start = start.get("dateTime") or start.get("date") or ""
-        if not start or not isinstance(start, str):
-            continue
+    models = [model]
+    if model != "gemini-2.5-flash-lite":
+        models.append("gemini-2.5-flash-lite")
+    if model != "gemini-2.5-flash":
+        models.append("gemini-2.5-flash")
+    for m in models:
         try:
-            day = datetime.datetime.fromisoformat(start.replace("Z", "+00:00")).strftime("%A")
-        except:
-            day = start[:10] if len(start) >= 10 else start
-        day_load[day] = day_load.get(day, 0) + 1
-
-    if day_load:
-        busiest = max(day_load, key=day_load.get)
-        lightest = min(day_load, key=day_load.get)
-        insights.append(dict(type="danger", message=f"⚠ {busiest} is your busiest day ({day_load[busiest]} event{'s' if day_load[busiest]!=1 else ''}). Avoid scheduling deep work then."))
-        # Only show lightest if it's a different day
-        if lightest != busiest:
-            insights.append(dict(type="tip", message=f"💡 {lightest} is your lightest day ({day_load[lightest]} event{'s' if day_load[lightest]!=1 else ''}). Great for focused study."))
-        else:
-            # Find days with NO events for free-day suggestion
-            all_days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-            free_days = [d for d in all_days if d not in day_load]
-            if free_days:
-                insights.append(dict(type="tip", message=f"💡 {free_days[0]} is completely free. Great for focused study."))
-
-    # Task load insight
-    total_hours = sum(t.get("estimatedMinutes", 60) for t in tasks) / 60
-    hard_tasks = [t for t in tasks if t.get("difficulty", 3) >= 4]
-    insights.append(dict(type="info", message=f"📊 {len(tasks)} tasks totaling ~{total_hours:.1f} hrs of study. {len(hard_tasks)} are high-difficulty."))
-
-    # Deadline clustering
-    if hard_tasks:
-        insights.append(dict(type="warn", message=f"🔥 {len(hard_tasks)} difficult task{'s' if len(hard_tasks)>1 else ''}: {', '.join(t['title'][:30] for t in hard_tasks[:3])}. Start early!"))
-
-    return insights[:5]
-
-def generate_study_blocks(events, tasks):
-    """Generate date-aware study blocks across multiple weeks.
-    Breaks tasks into micro-sessions and schedules them on real calendar dates,
-    working backwards from deadlines and avoiding busy hours."""
-
-    blocks = []
-    today = datetime.date.today()
-
-    # ── Build busy-hours map keyed by actual date ──
-    busy_by_date = {}  # "2026-03-10" -> {11, 12, 15, 16}
-    for ev in events:
-        start = ev.get("start", "")
-        if isinstance(start, dict):
-            start = start.get("dateTime") or start.get("date") or ""
-        if not start or not isinstance(start, str) or "T" not in start:
-            continue
-        try:
-            dt = datetime.datetime.fromisoformat(start.replace("Z", "+00:00"))
-            date_str = dt.strftime("%Y-%m-%d")
-            if date_str not in busy_by_date:
-                busy_by_date[date_str] = set()
-            # Block the event hour and the one before/after
-            for h in range(max(0, dt.hour - 1), min(24, dt.hour + 2)):
-                busy_by_date[date_str].add(h)
-        except:
-            pass
-
-    # ── Available study slots per day ──
-    study_slots = [
-        ("9:00 AM", 9), ("10:00 AM", 10), ("11:00 AM", 11),
-        ("1:00 PM", 13), ("2:00 PM", 14), ("3:00 PM", 15),
-        ("4:00 PM", 16), ("7:00 PM", 19), ("8:00 PM", 20),
-    ]
-
-    # ── Parse due dates and compute scheduling windows ──
-    def parse_due(due_str):
-        """Try to parse various date formats into a date object."""
-        if not due_str:
-            return None
-        import calendar as cal_mod
-        # Common formats
-        for fmt_str in ["%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y",
-                    "%m/%d/%Y", "%m/%d/%y", "%m/%d",
-                    "%A, %B %d", "%a, %b %d",
-                    "%a %m/%d", "%A %m/%d"]:
-            try:
-                d = datetime.datetime.strptime(due_str.strip(), fmt_str).date()
-                # If year is missing, use current year
-                if d.year == 1900:
-                    d = d.replace(year=today.year)
-                return d
-            except:
-                continue
-        # Try "Wed, Feb 4" / "Thu 3/12" style
-        m = re.search(r'(\d{1,2})/(\d{1,2})', due_str)
-        if m:
-            try:
-                month, day = int(m.group(1)), int(m.group(2))
-                return datetime.date(today.year, month, day)
-            except:
-                pass
-        # "March 12" / "Mar 12"
-        m = re.search(r'(\w+)\s+(\d{1,2})', due_str)
-        if m:
-            try:
-                month_str, day = m.group(1), int(m.group(2))
-                month_num = list(cal_mod.month_abbr).index(month_str[:3].capitalize())
-                return datetime.date(today.year, month_num, day)
-            except:
-                pass
-        return None
-
-    # ── Break tasks into micro-sessions and schedule them ──
-    scheduled_slots = {}  # "2026-03-10_14" -> True (tracks used slots)
-
-    for task in sorted(tasks, key=lambda t: t.get('difficulty', 3), reverse=True):
-        due = parse_due(task.get('dueDate', ''))
-        est = task.get('estimatedMinutes', 60)
-        difficulty = task.get('difficulty', 3)
-
-        # Default deadline: 2 weeks from today if none specified
-        if not due or due <= today:
-            due = today + datetime.timedelta(days=14)
-
-        # How many sessions to break this into
-        session_len = 45 if difficulty >= 4 else 60  # Harder tasks get shorter, more frequent sessions
-        num_sessions = max(1, min(6, (est + session_len - 1) // session_len))
-
-        # Spread sessions across days leading up to deadline
-        days_until = max(1, (due - today).days)
-        # Start studying at least this many days before due
-        start_offset = min(days_until, max(3, num_sessions * 2))
-
-        sessions_placed = 0
-        # Try to place sessions evenly spaced before the deadline
-        for s in range(num_sessions):
-            if sessions_placed >= num_sessions:
-                break
-
-            # Target day: spread evenly from (start_offset days before due) to (1 day before due)
-            day_offset = start_offset - int(s * (start_offset - 1) / max(1, num_sessions - 1))
-            target_date = due - datetime.timedelta(days=day_offset)
-            if target_date <= today:
-                target_date = today + datetime.timedelta(days=1)
-
-            # Try target day, then nearby days
-            for day_adj in [0, 1, -1, 2, -2, 3]:
-                try_date = target_date + datetime.timedelta(days=day_adj)
-                if try_date <= today or try_date >= due:
-                    continue
-                date_str = try_date.strftime("%Y-%m-%d")
-                busy = busy_by_date.get(date_str, set())
-
-                # Find an open slot
-                for time_str, hour in study_slots:
-                    slot_key = f"{date_str}_{hour}"
-                    if slot_key in scheduled_slots:
-                        continue
-                    if hour in busy:
-                        continue
-
-                    # Place the session
-                    session_title = task['title']
-                    if num_sessions > 1:
-                        session_title = f"{task['title']} (part {sessions_placed+1}/{num_sessions})"
-
-                    blocks.append(dict(
-                        date=date_str,
-                        day=try_date.strftime("%a"),
-                        time=time_str,
-                        hour=hour,
-                        task=task['title'],
-                        sessionTitle=session_title,
-                        duration=session_len,
-                        course=task.get('course', ''),
-                        type=task.get('type', 'review'),
-                        difficulty=difficulty,
-                        dueDate=due.strftime("%Y-%m-%d"),
-                        taskId=task.get('id'),
-                    ))
-                    scheduled_slots[slot_key] = True
-                    sessions_placed += 1
-                    break
-                else:
-                    continue
-                break
-
-    # Sort by date and time
-    blocks.sort(key=lambda b: (b['date'], b.get('hour', 0)))
-    return blocks
-
-def gemini_request_light(prompt, max_tokens=800):
-    """Lightweight Gemini call with retry across multiple models.
-    Used only for optional AI enrichment — plan still works without it."""
-    models = ["gemini-1.5-flash", "gemini-2.0-flash-lite", "gemini-2.0-flash"]
-
-    for model in models:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
-            r = http_req.post(url, json=dict(
-                contents=[dict(role="user", parts=[dict(text=prompt)])],
-                generationConfig=dict(temperature=0.5, maxOutputTokens=max_tokens, responseMimeType="application/json")
-            ), timeout=15)
-
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={GEMINI_KEY}"
+            gen_config = dict(temperature=0.4, maxOutputTokens=max_tokens)
+            if json_mode:
+                gen_config["responseMimeType"] = "application/json"
+            r = http_req.post(
+                url,
+                json=dict(
+                    contents=[dict(role="user", parts=[dict(text=user_prompt)])],
+                    systemInstruction=dict(parts=[dict(text=system_prompt)]),
+                    generationConfig=gen_config,
+                ),
+                timeout=45,
+            )
             if r.status_code == 200:
                 res = r.json()
                 candidates = res.get("candidates", [])
                 if candidates:
-                    txt = "".join(p.get("text", "") for p in candidates[0].get("content", {}).get("parts", []))
-                    print(f"[gemini_light] ✓ {model} ({len(txt)} chars)")
+                    txt = "".join(
+                        p.get("text", "")
+                        for p in candidates[0].get("content", {}).get("parts", [])
+                    )
+                    print(f"[gemini] {m} ({len(txt)} chars)")
                     return txt
-
             if r.status_code == 429:
-                print(f"[gemini_light] {model} quota exhausted, trying next...")
+                print(f"[gemini] {m} rate limited")
                 continue
-
-            print(f"[gemini_light] {model} returned {r.status_code}, trying next...")
+            print(f"[gemini] {m} returned {r.status_code}")
         except Exception as e:
-            print(f"[gemini_light] {model} failed: {e}")
+            print(f"[gemini] {m} error: {e}")
             continue
+    return None
 
-    return None  # All models exhausted — that's okay, plan still works
 
-# ═══ GROQ FALLBACK (free, fast, generous quota) ═══
-def groq_chat(system, messages, max_tokens=1500):
-    """Call Groq API (free tier: 30 req/min, 14400/day). Uses Llama 3.1."""
+def groq_call(system_prompt, user_prompt, max_tokens=2000, json_mode=False):
     if not GROQ_KEY:
+        print("[groq] No API key set")
         return None
     try:
-        print(f"[groq] Calling llama-3.1-8b-instant...")
+        body = dict(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=max_tokens,
+            temperature=0.4,
+        )
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
+        print("[groq] Calling llama-3.3-70b...")
         r = http_req.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-            json=dict(
-                model="llama-3.1-8b-instant",
-                messages=[{"role": "system", "content": system}] + messages,
-                max_tokens=max_tokens,
-                temperature=0.7,
-            ),
-            timeout=30,
+            headers={
+                "Authorization": f"Bearer {GROQ_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=60,
         )
         if r.status_code == 200:
             txt = r.json()["choices"][0]["message"]["content"]
-            print(f"[groq] ✓ Success ({len(txt)} chars)")
+            print(f"[groq] ({len(txt)} chars)")
             return txt
-        print(f"[groq] Error {r.status_code}: {r.text[:120]}")
+        print(f"[groq] Error {r.status_code}: {r.text[:200]}")
     except Exception as e:
         print(f"[groq] Failed: {e}")
     return None
 
-# ═══ AI CHAT (Gemini → Groq fallback) ═══
-@app.route("/api/ai/chat",methods=["POST"])
+
+def ai_call(
+    system_prompt,
+    user_prompt,
+    model="gemini-2.5-flash-lite",
+    max_tokens=2000,
+    json_mode=False,
+):
+    result = gemini_call(system_prompt, user_prompt, model, max_tokens, json_mode)
+    if result:
+        return result
+    print("[ai] Gemini unavailable, trying Groq...")
+    result = groq_call(system_prompt, user_prompt, max_tokens, json_mode)
+    if result:
+        return result
+    return None
+
+
+# --- AUTH ---
+
+
+@app.route("/auth/login")
+def auth_login():
+    f = get_flow()
+    url, state = f.authorization_url(access_type="offline", prompt="consent")
+    session["state"] = state
+    return redirect(url)
+
+
+@app.route("/auth/callback")
+def auth_callback():
+    f = get_flow()
+    f.fetch_token(authorization_response=request.url)
+    save_creds(f.credentials)
+    return redirect(f"{FRONTEND_URL}?auth=success")
+
+
+@app.route("/auth/status")
+def auth_status():
+    return jsonify(authenticated="creds" in session)
+
+
+@app.route("/auth/logout", methods=["POST"])
+def auth_logout():
+    session.clear()
+    return jsonify(ok=True)
+
+
+# --- CALENDAR ---
+
+
+@app.route("/api/calendars")
+@need_auth
+def list_calendars():
+    svc = cal_svc()
+    result = svc.calendarList().list().execute()
+    return jsonify(
+        calendars=[
+            dict(
+                id=c["id"],
+                name=c.get("summary", ""),
+                color=c.get("backgroundColor", "#4285f4"),
+                primary=c.get("primary", False),
+            )
+            for c in result.get("items", [])
+            if "#holiday@" not in c["id"]
+        ]
+    )
+
+
+@app.route("/api/events")
+@need_auth
+def list_events():
+    svc = cal_svc()
+    t_min = request.args.get("timeMin")
+    t_max = request.args.get("timeMax")
+    tz = request.args.get("timeZone", "America/New_York")
+    if not t_min or not t_max:
+        return jsonify(error="timeMin and timeMax required"), 400
+    if not t_min.endswith("Z"):
+        t_min += "Z"
+    if not t_max.endswith("Z"):
+        t_max += "Z"
+    calendars = svc.calendarList().list().execute().get("items", [])
+    events = []
+    for cal in calendars:
+        if "#holiday@" in cal["id"]:
+            continue
+        try:
+            result = (
+                svc.events()
+                .list(
+                    calendarId=cal["id"],
+                    timeMin=t_min,
+                    timeMax=t_max,
+                    timeZone=tz,
+                    singleEvents=True,
+                    orderBy="startTime",
+                )
+                .execute()
+            )
+            for ev in result.get("items", []):
+                start = ev.get("start", {})
+                end = ev.get("end", {})
+                events.append(
+                    dict(
+                        id=ev.get("id"),
+                        summary=ev.get("summary", ""),
+                        location=ev.get("location", ""),
+                        start=start.get("dateTime") or start.get("date", ""),
+                        end=end.get("dateTime") or end.get("date", ""),
+                        allDay="date" in start and "dateTime" not in start,
+                        calendarName=cal.get("summary", ""),
+                        calendarColor=cal.get("backgroundColor", "#4285f4"),
+                    )
+                )
+        except Exception:
+            continue
+    events.sort(key=lambda e: e["start"])
+    return jsonify(events=events, count=len(events))
+
+
+# --- AI ENDPOINTS ---
+
+SCHEDULE_SYSTEM = """You are an intelligent study schedule planner that prevents student burnout.
+Decide which tasks should be studied on which days, in what order, and with what topics.
+Spread harder tasks across more days, start difficult tasks earlier, leave buffer before exams.
+Events are time blocks not study tasks. Respect blocked days and busy times."""
+
+
+@app.route("/api/ai/generate-schedule", methods=["POST"])
+@need_auth
+def generate_schedule():
+    data = request.get_json()
+    deadlines = data.get("deadlines", [])
+    constraints = data.get("constraints", {})
+    calendar_events = data.get("calendarEvents", [])
+    today = data.get("todayDate") or datetime.date.today().isoformat()
+
+    if not deadlines:
+        return jsonify(error="Add at least one deadline"), 400
+
+    budget_lines = []
+    expected_totals = {}
+    for d in deadlines:
+        est = d.get("estimatedMinutes", 60)
+        title = d.get("title", "Task")
+        expected_totals[title] = est
+        budget_lines.append(
+            f"- {title}: {est}min, due {d.get('dueDate','')}, difficulty {d.get('difficulty',3)}/5"
+        )
+
+    prompt = f"""Today is {today}.
+
+TASKS:
+{chr(10).join(budget_lines)}
+
+CALENDAR EVENTS (avoid):
+{json.dumps(calendar_events[:20], indent=2)}
+
+CONSTRAINTS:
+- Blocked days: {', '.join(constraints.get('blockedDays', [])) or 'none'}
+- Busy times: {json.dumps(constraints.get('timeBlocks', [])) if constraints.get('timeBlocks') else 'none'}
+
+DEADLINES:
+{json.dumps(deadlines, indent=2)}
+
+For each day from {today} to the last deadline, list which tasks to work on, start times, and topics.
+
+Return ONLY JSON:
+{{"schedule":[{{"date":"YYYY-MM-DD","tasks":[{{"taskTitle":"...","startTime":"HH:MM","topic":"or null"}}],"cognitive_load":1-10}}],"warnings":["..."],"insights":[{{"type":"danger|tip|info|warn","message":"..."}}]}}
+
+Include ALL days. Blocked days: tasks:[], cognitive_load:0. No tasks before 08:00 or after 22:00."""
+
+    result = ai_call(
+        SCHEDULE_SYSTEM,
+        prompt,
+        model="gemini-2.5-flash",
+        max_tokens=8000,
+        json_mode=True,
+    )
+    if not result:
+        return jsonify(error="AI unavailable. Try again."), 503
+
+    print(f"[gen_plan] AI response ({len(result)} chars)")
+    parsed = try_parse_json(result)
+    if not parsed:
+        return jsonify(error="AI returned invalid format."), 500
+
+    ai_schedule = parsed.get("schedule", [])
+
+    # --- PYTHON DISTRIBUTES EXACT HOURS ---
+    blocked_names = set(constraints.get("blockedDays", []))
+    max_session = 90
+
+    # Find available dates
+    start_d = datetime.date.fromisoformat(today)
+    last_due = max((d.get("dueDate", today) for d in deadlines), default=today)
+    end_d = datetime.date.fromisoformat(last_due)
+    all_available = []
+    cur = start_d
+    while cur <= end_d:
+        if cur.strftime("%A") not in blocked_names:
+            all_available.append(cur.isoformat())
+        cur += datetime.timedelta(days=1)
+
+    # Collect AI day assignments per task
+    task_day_slots = {}
+    for day in ai_schedule:
+        for t in day.get("tasks", day.get("sessions", [])):
+            title = t.get("taskTitle", "")
+            if title and title in expected_totals:
+                slot = (day["date"], t.get("startTime", "09:00"), t.get("topic"))
+                if title not in task_day_slots:
+                    task_day_slots[title] = []
+                task_day_slots[title].append(slot)
+
+    # Ensure enough slots per task
+    for title, est in expected_totals.items():
+        slots = task_day_slots.get(title, [])
+        dl = next((d for d in deadlines if d.get("title") == title), None)
+        due = dl.get("dueDate", last_due) if dl else last_due
+
+        # Remove slots on/after due date
+        slots = [s for s in slots if s[0] < due]
+
+        min_slots = max(1, -(-est // max_session))
+        if len(slots) < min_slots:
+            used = set(s[0] for s in slots)
+            candidates = [d for d in all_available if d < due and d not in used]
+            needed = min_slots - len(slots)
+            topics_list = []
+            if dl and dl.get("topics"):
+                topics_list = [t.strip() for t in dl["topics"].split(",") if t.strip()]
+            for cd in reversed(candidates):
+                if needed <= 0:
+                    break
+                topic = (
+                    topics_list[len(slots) % len(topics_list)] if topics_list else None
+                )
+                slots.append((cd, "09:00", topic))
+                needed -= 1
+
+        if not slots:
+            candidates = [d for d in all_available if d < due] or [today]
+            slots = [(candidates[-1], "09:00", None)]
+
+        task_day_slots[title] = slots
+
+    # Distribute exact minutes
+    final_schedule = {}
+    for day in ai_schedule:
+        if day["date"] not in final_schedule:
+            final_schedule[day["date"]] = {
+                "date": day["date"],
+                "sessions": [],
+                "cognitive_load": 0,
+            }
+
+    for title, slots in task_day_slots.items():
+        est = expected_totals.get(title, 60)
+        n = len(slots)
+        base = est // n
+        rem = est % n
+        for i, (date, start_time, topic) in enumerate(slots):
+            dur = base + (1 if i < rem else 0)
+            if dur <= 0:
+                continue
+            if date not in final_schedule:
+                final_schedule[date] = {
+                    "date": date,
+                    "sessions": [],
+                    "cognitive_load": 0,
+                }
+            final_schedule[date]["sessions"].append(
+                {
+                    "taskTitle": title,
+                    "startTime": start_time,
+                    "duration": dur,
+                    "type": "study",
+                    "topic": topic,
+                }
+            )
+
+    # Sort sessions, enforce gaps, calc load
+    for date, day in final_schedule.items():
+        sessions = sorted(day["sessions"], key=lambda s: s.get("startTime", "00:00"))
+        for i in range(1, len(sessions)):
+            prev = sessions[i - 1]
+            curr = sessions[i]
+            if prev.get("startTime") and curr.get("startTime") and prev.get("duration"):
+                ph, pm = map(int, prev["startTime"].split(":"))
+                prev_end = ph * 60 + pm + prev["duration"]
+                ch, cm = map(int, curr["startTime"].split(":"))
+                if ch * 60 + cm < prev_end + 15:
+                    ns = prev_end + 15
+                    nh, nm = divmod(ns, 60)
+                    if nh < 22:
+                        curr["startTime"] = f"{nh:02d}:{nm:02d}"
+        day["sessions"] = sessions
+        day_name = datetime.date.fromisoformat(date).strftime("%A")
+        if day_name in blocked_names:
+            day["sessions"] = []
+            day["cognitive_load"] = 0
+        else:
+            total_hrs = sum(s.get("duration", 0) for s in sessions) / 60
+            if total_hrs == 0:
+                day["cognitive_load"] = 0
+            elif total_hrs <= 1:
+                day["cognitive_load"] = 2
+            elif total_hrs <= 2:
+                day["cognitive_load"] = 3
+            elif total_hrs <= 3:
+                day["cognitive_load"] = 5
+            elif total_hrs <= 4:
+                day["cognitive_load"] = 6
+            elif total_hrs <= 5:
+                day["cognitive_load"] = 7
+            elif total_hrs <= 6:
+                day["cognitive_load"] = 8
+            else:
+                day["cognitive_load"] = min(10, round(8 + (total_hrs - 6)))
+
+    schedule_list = sorted(final_schedule.values(), key=lambda d: d["date"])
+
+    # Verify
+    for t, exp in expected_totals.items():
+        act = sum(
+            s["duration"]
+            for day in schedule_list
+            for s in day["sessions"]
+            if s["taskTitle"] == t
+        )
+        print(
+            f"[gen_plan] {'ok' if act == exp else 'MISMATCH'} {t}: {act}min / {exp}min"
+        )
+
+    return jsonify(
+        schedule=schedule_list,
+        warnings=parsed.get("warnings", []),
+        insights=parsed.get("insights", []),
+    )
+
+
+RESCHEDULE_SYSTEM = "You redistribute missed study sessions. Keep responses short. Return only valid JSON."
+
+RESCHEDULE_SYSTEM = "You are a study schedule optimizer. Decide how to redistribute missed study time. Return only valid JSON."
+
+
+@app.route("/api/ai/reschedule", methods=["POST"])
+@need_auth
+def reschedule():
+    data = request.get_json()
+    missed_date = data.get("missedDate")
+    missed_sessions = data.get("missedSessions", [])
+    current_schedule = data.get("currentSchedule", [])
+    constraints = data.get("constraints", {})
+
+    if not missed_date or not missed_sessions:
+        return jsonify(error="No missed sessions"), 400
+
+    blocked_names = set(constraints.get("blockedDays", []))
+
+    # Get next available days
+    next_days = []
+    for d in current_schedule:
+        if d["date"] <= missed_date:
+            continue
+        day_name = datetime.date.fromisoformat(d["date"]).strftime("%A")
+        if day_name not in blocked_names:
+            next_days.append(d)
+        if len(next_days) >= 5:
+            break
+
+    if not next_days:
+        return jsonify(error="No upcoming days to reschedule into"), 400
+
+    # Group missed by task
+    missed_by_task = {}
+    for s in missed_sessions:
+        title = s.get("taskTitle", "")
+        if not title:
+            continue
+        if title not in missed_by_task:
+            missed_by_task[title] = {"minutes": 0, "topic": s.get("topic")}
+        missed_by_task[title]["minutes"] += s.get("duration", 0)
+
+    total_missed = sum(v["minutes"] for v in missed_by_task.values())
+    day_dates = [d["date"] for d in next_days]
+    task_list = [f"{t}: {v['minutes']}min" for t, v in missed_by_task.items()]
+
+    # Ask AI: how should we distribute? (simple question, simple answer)
+    prompt = f"""Student missed these on {missed_date}: {', '.join(task_list)}.
+Available days: {', '.join(day_dates)}.
+Existing load per day: {', '.join(f"{d['date']}={sum(s.get('duration',0) for s in d.get('sessions',[]))}min" for d in next_days)}.
+
+How should the {total_missed}min be spread? Consider which tasks are most urgent (closest deadline).
+
+Return ONLY this JSON — assign exact percentages that sum to 100 for each day:
+{{"distribution":{{"YYYY-MM-DD": percentage, ...}}, "reasoning": "brief explanation"}}"""
+
+    ai_result = ai_call(
+        RESCHEDULE_SYSTEM,
+        prompt,
+        model="gemini-2.5-flash",
+        max_tokens=1000,
+        json_mode=True,
+    )
+    ai_parsed = try_parse_json(ai_result) if ai_result else None
+
+    # Get distribution weights (AI decides, or fallback to even split)
+    weights = {}
+    reasoning = "Spread evenly across available days"
+    if ai_parsed and "distribution" in ai_parsed:
+        raw_dist = ai_parsed["distribution"]
+        total_pct = sum(raw_dist.values())
+        if total_pct > 0:
+            weights = {k: v / total_pct for k, v in raw_dist.items()}
+            reasoning = ai_parsed.get("reasoning", reasoning)
+            print(f"[reschedule] AI distribution: {raw_dist} — {reasoning}")
+
+    if not weights:
+        # Even split fallback
+        for d in day_dates:
+            weights[d] = 1.0 / len(day_dates)
+        print(f"[reschedule] Using even distribution")
+
+    # Python executes: distribute each task's minutes using AI's weights
+    updated_days = {}
+    for title, info in missed_by_task.items():
+        task_total = info["minutes"]
+        allocated = 0
+
+        sorted_dates = sorted(weights.keys())
+        for i, date in enumerate(sorted_dates):
+            if date not in [d["date"] for d in next_days]:
+                continue
+            if i == len(sorted_dates) - 1:
+                dur = task_total - allocated  # last day gets remainder — exact match
+            else:
+                dur = round(task_total * weights.get(date, 0))
+            allocated += dur
+
+            if dur <= 0:
+                continue
+
+            if date not in updated_days:
+                existing = next((d for d in next_days if d["date"] == date), {})
+                updated_days[date] = {
+                    "date": date,
+                    "sessions": list(existing.get("sessions", [])),
+                    "cognitive_load": 0,
+                }
+
+            # Find start time after existing sessions
+            existing_sessions = updated_days[date]["sessions"]
+            start_hour = 9
+            if existing_sessions:
+                last = existing_sessions[-1]
+                if last.get("startTime") and last.get("duration"):
+                    lh, lm = map(int, last["startTime"].split(":"))
+                    end_min = lh * 60 + lm + last["duration"] + 15
+                    start_hour = end_min // 60
+            if start_hour >= 22:
+                start_hour = 9
+
+            updated_days[date]["sessions"].append(
+                {
+                    "taskTitle": title,
+                    "startTime": f"{start_hour:02d}:00",
+                    "duration": dur,
+                    "type": "study",
+                    "topic": info.get("topic"),
+                }
+            )
+
+    # Recalculate cognitive load
+    for date, day in updated_days.items():
+        total_hrs = sum(s.get("duration", 0) for s in day["sessions"]) / 60
+        if total_hrs == 0:
+            day["cognitive_load"] = 0
+        elif total_hrs <= 1:
+            day["cognitive_load"] = 2
+        elif total_hrs <= 2:
+            day["cognitive_load"] = 3
+        elif total_hrs <= 3:
+            day["cognitive_load"] = 5
+        elif total_hrs <= 4:
+            day["cognitive_load"] = 6
+        elif total_hrs <= 5:
+            day["cognitive_load"] = 7
+        elif total_hrs <= 6:
+            day["cognitive_load"] = 8
+        else:
+            day["cognitive_load"] = min(10, round(8 + (total_hrs - 6)))
+
+    print(
+        f"[reschedule] {total_missed}min redistributed across {len(updated_days)} days — {reasoning}"
+    )
+
+    return jsonify(
+        updated_days=list(updated_days.values()),
+        message=reasoning,
+    )
+
+
+CHAT_SYSTEM_TEMPLATE = """You are a supportive study coach called Cognitive Scaffold AI.
+Student data:
+EVENTS: {events}
+DEADLINES: {deadlines}
+SCHEDULE: {schedule_summary}
+CONSTRAINTS: {constraints}
+
+Rules: Keep responses 100-200 words. Short paragraphs. Always complete your thoughts. Be warm and actionable. Reference their real data."""
+
+
+@app.route("/api/ai/chat", methods=["POST"])
 @need_auth
 def ai_chat():
-    if not GEMINI_KEY and not GROQ_KEY:
-        return jsonify(error="Set GEMINI_API_KEY or GROQ_API_KEY in .env"),500
+    data = request.get_json()
+    message = data.get("message", "")
+    history = data.get("history", [])
+    context = data.get("context", {})
+    system = CHAT_SYSTEM_TEMPLATE.format(
+        events=context.get("events", "None"),
+        deadlines=context.get("deadlines", "None"),
+        schedule_summary=context.get("scheduleSummary", "None"),
+        constraints=context.get("constraints", "None"),
+    )
+    conv = "\n".join(
+        f"{'Student' if m['role']=='user' else 'Coach'}: {m['content']}"
+        for m in history
+    )
+    conv += f"\nStudent: {message}"
+    result = ai_call(
+        system, conv, model="gemini-2.5-flash", max_tokens=4000, json_mode=False
+    )
+    if not result:
+        return jsonify(error="AI unavailable."), 503
+    return jsonify(response=result)
 
-    data=request.get_json(); msg=data.get("message",""); history=data.get("history",[])
-    cal_ctx=get_week_events()
-    upload_ctx=""
-    for ft,info in session.get("uploads",{}).items():
-        upload_ctx+=f"\n\n=== Uploaded {ft} ({info['filename']}) ===\n{info.get('text','')[:2000]}"
-    system=f"""You are StudyFlow AI, an expert academic study advisor with access to the student's real Google Calendar and uploaded course materials.
-
-{cal_ctx}
-{upload_ctx if upload_ctx else "No course materials uploaded yet."}
-
-Help with: study resources, strategies, time management, course-specific questions, syllabus analysis. Keep responses concise and actionable. Reference their real schedule when relevant."""
-
-    # ── Try Gemini first ──
-    if GEMINI_KEY:
-        contents=[{"role":"user" if m["role"]=="user" else "model","parts":[{"text":m["content"]}]} for m in history]
-        contents.append({"role":"user","parts":[{"text":msg}]})
-
-        models = ["gemini-1.5-flash", "gemini-2.0-flash-lite", "gemini-2.0-flash"]
-        for model in models:
-            try:
-                print(f"[ai_chat] Trying Gemini {model}...")
-                r = http_req.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}",
-                    json=dict(contents=contents, systemInstruction=dict(parts=[dict(text=system)]),
-                              generationConfig=dict(temperature=0.7, maxOutputTokens=1500)),
-                    timeout=30
-                )
-                if r.status_code == 429:
-                    print(f"[ai_chat] {model} quota exhausted, trying next...")
-                    continue
-                if r.status_code == 200:
-                    res = r.json()
-                    txt = "".join(p.get("text","") for p in res.get("candidates",[{}])[0].get("content",{}).get("parts",[]))
-                    print(f"[ai_chat] ✓ Gemini {model} ({len(txt)} chars)")
-                    return jsonify(response=txt or "Couldn't generate a response.")
-            except Exception as e:
-                print(f"[ai_chat] Gemini {model} error: {e}")
-                continue
-        print("[ai_chat] All Gemini models exhausted, falling back to Groq...")
-
-    # ── Fallback to Groq ──
-    openai_msgs = [{"role": m["role"], "content": m["content"]} for m in history]
-    openai_msgs.append({"role": "user", "content": msg})
-    txt = groq_chat(system, openai_msgs)
-    if txt:
-        return jsonify(response=txt)
-
-    return jsonify(error="All AI providers are at capacity. Please try again in a minute."),500
-
-# ═══ PLAN GENERATION (HYBRID: local extraction + optional AI enrichment) ═══
-@app.route("/api/generate-plan",methods=["POST"])
-@need_auth
-def gen_plan():
-    uploads = session.get("uploads", {})
-    if not uploads:
-        return jsonify(error="Upload at least one file first (syllabus, schedule, or assignments)"), 400
-
-    print(f"[gen_plan] Processing {len(uploads)} upload(s)...")
-
-    # ── Step 1: Extract tasks locally from uploaded text (FREE, instant) ──
-    all_tasks = []
-    for ft, info in uploads.items():
-        text = info.get("text", "")
-        if text:
-            tasks = extract_tasks_from_text(text, ft)
-            print(f"[gen_plan] Extracted {len(tasks)} tasks from {ft} ({info['filename']})")
-            all_tasks.extend(tasks)
-
-    # Deduplicate by title similarity
-    seen = set()
-    unique_tasks = []
-    for t in all_tasks:
-        key = re.sub(r'[^a-z0-9]', '', t['title'].lower())[:30]
-        if key not in seen:
-            seen.add(key)
-            t['id'] = len(unique_tasks) + 1
-            t['priority'] = len(unique_tasks) + 1
-            unique_tasks.append(t)
-    unique_tasks = unique_tasks[:12]
-
-    # ── Step 2: Get calendar events for scheduling ──
-    events = []
-    try:
-        svc = cal_svc()
-        if svc:
-            now = datetime.datetime.now()
-            s = now.replace(hour=0, minute=0, second=0)
-            e = s + datetime.timedelta(days=7)
-            cals = svc.calendarList().list().execute().get("items", [])
-            for cal in cals:
-                if "#holiday@" in cal["id"]:
-                    continue
-                try:
-                    evts = svc.events().list(
-                        calendarId=cal["id"], timeMin=s.isoformat()+"Z",
-                        timeMax=e.isoformat()+"Z", singleEvents=True, orderBy="startTime"
-                    ).execute()
-                    events.extend(evts.get("items", []))
-                except:
-                    continue
-    except:
-        pass
-
-    # ── Step 3: Generate insights and study blocks locally (FREE, instant) ──
-    insights = generate_insights_from_events(events, unique_tasks)
-    study_blocks = generate_study_blocks(events, unique_tasks)
-
-    print(f"[gen_plan] Local plan: {len(unique_tasks)} tasks, {len(insights)} insights, {len(study_blocks)} blocks")
-
-    # ── Step 4: OPTIONAL — enrich with AI if available ──
-    if unique_tasks and (GEMINI_KEY or GROQ_KEY):
-        task_summary = "; ".join(f"{t['title']} (diff:{t['difficulty']})" for t in unique_tasks[:8])
-        enrich_prompt = f"""Given these student tasks: {task_summary}
-Return ONLY JSON with 3-4 extra insights:
-{{"insights":[{{"type":"danger|tip|info|warn","message":"..."}}]}}
-Keep messages short and actionable. Focus on study strategy."""
-
-        try:
-            ai_txt = None
-
-            # Try Gemini first
-            if GEMINI_KEY:
-                ai_txt = gemini_request_light(enrich_prompt, max_tokens=500)
-
-            # Fallback to Groq
-            if not ai_txt and GROQ_KEY:
-                print("[gen_plan] Gemini unavailable, trying Groq for enrichment...")
-                groq_resp = groq_chat(
-                    "You are a study advisor. Return ONLY valid JSON, no markdown.",
-                    [{"role": "user", "content": enrich_prompt}],
-                    max_tokens=500
-                )
-                if groq_resp:
-                    ai_txt = groq_resp
-
-            if ai_txt:
-                ai_txt = ai_txt.strip()
-                m = re.search(r'```(?:json)?\s*\n?(.*?)```', ai_txt, re.DOTALL)
-                if m:
-                    ai_txt = m.group(1).strip()
-                if not ai_txt.startswith('{'):
-                    start = ai_txt.find('{')
-                    end = ai_txt.rfind('}')
-                    if start != -1 and end != -1:
-                        ai_txt = ai_txt[start:end+1]
-                ai_data = json.loads(ai_txt)
-                ai_insights = ai_data.get("insights", [])
-                insights.extend(ai_insights[:3])
-                print(f"[gen_plan] AI enriched with {len(ai_insights)} extra insights")
-        except Exception as e:
-            print(f"[gen_plan] AI enrichment skipped (non-fatal): {e}")
-
-    plan = dict(tasks=unique_tasks, insights=insights, studyBlocks=study_blocks)
-    print(f"[gen_plan] ✓ Final plan: {len(plan['tasks'])} tasks, {len(plan['insights'])} insights, {len(plan['studyBlocks'])} blocks")
-    return jsonify(plan=plan)
 
 @app.route("/health")
 def health():
@@ -770,13 +762,13 @@ def health():
         oauth=os.path.exists(CLIENT_SECRETS),
     )
 
-if __name__=="__main__":
-    os.environ["OAUTHLIB_INSECURE_TRANSPORT"]="1"
+
+if __name__ == "__main__":
+    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
     print(f"\n{'='*50}")
-    print(f"  StudyFlow.ai Backend")
-    print(f"  Gemini: {'loaded' if GEMINI_KEY else 'NOT SET'}")
-    print(f"  Groq:   {'loaded' if GROQ_KEY else 'NOT SET'}")
-    print(f"  Chat: Gemini → Groq fallback")
-    print(f"  Plan: local extraction + AI enrichment")
+    print(f"  Cognitive Scaffold")
+    print(
+        f"  Gemini: {'Y' if GEMINI_KEY else 'N'} | Groq: {'Y' if GROQ_KEY else 'N'} | OAuth: {'Y' if os.path.exists(CLIENT_SECRETS) else 'N'}"
+    )
     print(f"{'='*50}\n")
-    app.run(host="0.0.0.0",port=5000,debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True)
