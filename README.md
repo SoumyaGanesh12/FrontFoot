@@ -4,7 +4,7 @@
 
 LoadLens connects to your Google Calendar, lets you add deadlines and exams, and uses AI to build a study schedule around your real life. A cognitive load heatmap shows you exactly which days are going to be heavy, before they arrive.
 
-[Demo](https://drive.google.com/file/d/1RlnPJlzreKQLU3R45iusZuUNHwft6mGg/view?usp=sharing)
+See it in action: [Watch the demo](https://drive.google.com/file/d/1RlnPJlzreKQLU3R45iusZuUNHwft6mGg/view?usp=sharing)
 
 ---
 
