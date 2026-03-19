@@ -114,7 +114,7 @@ LoadLens/
 cd backend
 
 cp .env.example .env
-# Open .env and paste your GEMINI_API_KEY
+# Open .env and paste your GEMINI_API_KEY, GROQ_KEY
 
 python -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
@@ -176,7 +176,6 @@ All variables go in `backend/.env`. Copy `backend/.env.example` to get started.
 
 **Frontend**
 - React 18, Vite 6
-- No UI framework - custom design system via inline styles and a shared theme
 
 **Auth**
 - Session-based Google OAuth2 (read-only calendar scope)
