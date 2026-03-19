@@ -6,6 +6,12 @@ LoadLens connects to your Google Calendar, lets you add deadlines and exams, and
 
 ---
 
+## Demo
+
+[Watch the demo video](https://drive.google.com/file/d/1RlnPJlzreKQLU3R45iusZuUNHwft6mGg/view?usp=sharing)
+
+---
+
 ## Features
 
 | Feature | Description |
@@ -114,7 +120,7 @@ LoadLens/
 cd backend
 
 cp .env.example .env
-# Open .env and paste your GEMINI_API_KEY, GROQ_KEY
+# Open .env and paste your GEMINI_API_KEY, GROQ_API_KEY
 
 python -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
