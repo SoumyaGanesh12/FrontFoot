@@ -8,7 +8,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-CLIENT_SECRETS = os.getenv("GOOGLE_CLIENT_SECRETS", "client_secret.json")
+_backend_secret = os.path.join(os.path.dirname(__file__), "client_secret.json")
+_root_secret = os.path.join(os.path.dirname(__file__), "..", "client_secret.json")
+CLIENT_SECRETS = os.getenv("GOOGLE_CLIENT_SECRETS") or (_backend_secret if os.path.exists(_backend_secret) else _root_secret)
 SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI", "http://localhost:5000/auth/callback")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")

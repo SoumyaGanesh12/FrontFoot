@@ -186,7 +186,7 @@ export default function App() {
             <span style={{ background: `linear-gradient(135deg, ${C.accent}, ${C.rose})`, WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>before it hits you.</span>
           </h1>
           <p style={{ color: C.text2, fontSize: 15, lineHeight: 1.7, marginBottom: 36 }}>
-            Connect your calendar, add your deadlines, and get a clear picture of your week — so you always have energy when it counts.
+            Connect your calendar, add your deadlines, and get a clear picture of your week - so you always have energy when it counts.
           </p>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
             {[
@@ -228,7 +228,7 @@ export default function App() {
 
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 18 }}>
               <div style={{ flex: 1, height: 1, background: C.border }} />
-              <span style={{ fontSize: 11, color: C.text3 }}>new here?</span>
+              <span style={{ fontSize: 11, color: C.text3 }}>New here?</span>
               <div style={{ flex: 1, height: 1, background: C.border }} />
             </div>
 

@@ -295,7 +295,7 @@ Return ONLY this JSON — assign exact percentages that sum to 100 for each day:
     weights = {}
     reasoning = "Spread evenly across available days"
     if ai_parsed and "distribution" in ai_parsed:
-        raw_dist = ai_parsed["distribution"]
+        raw_dist = {k: float(str(v).replace('%', '').strip()) for k, v in ai_parsed["distribution"].items()}
         total_pct = sum(raw_dist.values())
         if total_pct > 0:
             weights = {k: v / total_pct for k, v in raw_dist.items()}
